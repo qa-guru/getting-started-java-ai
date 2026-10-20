@@ -32,6 +32,12 @@ jobs:
     timeout-minutes: 30
     outputs:
       report-generated: ${{ steps.report.outcome == 'success' }}
+      compile-outcome: ${{ steps.compile.outcome }}
+      tests-outcome: ${{ steps.tests.outcome }}
+      stats-ok: ${{ steps.stats.outputs.ok }}
+      stats-passed: ${{ steps.stats.outputs.passed }}
+      stats-failed: ${{ steps.stats.outputs.failed }}
+      stats-skipped: ${{ steps.stats.outputs.skipped }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -142,6 +148,11 @@ jobs:
           "-Dselenide.browserBinary=$CHROME_PATH"
           "-Dwebdriver.chrome.driver=$CHROMEDRIVER_PATH"
 
+      - name: Collect JUnit test stats
+        id: stats
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        run: python3 .github/scripts/junit_stats.py build/test-results/test --github-output "$GITHUB_OUTPUT"
+
       - name: Upload Allure results
         if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -202,7 +213,67 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page-url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy Allure report to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  notify:
+    needs: [ui-tests, deploy-report]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout notification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+
+      - name: Determine run status
+        id: status
+        env:
+          UI_TESTS_RESULT: ${{ needs.ui-tests.result }}
+          COMPILE_OUTCOME: ${{ needs.ui-tests.outputs.compile-outcome }}
+          TESTS_OUTCOME: ${{ needs.ui-tests.outputs.tests-outcome }}
+          IS_DEFAULT_BRANCH: ${{ github.ref_name == github.event.repository.default_branch }}
+          PAGE_URL: ${{ needs.deploy-report.outputs.page-url }}
+        run: |
+          if [[ "$UI_TESTS_RESULT" == "cancelled" ]]; then
+            status=cancelled
+          elif [[ "$COMPILE_OUTCOME" != "success" ]]; then
+            status=build-failed
+          elif [[ "$TESTS_OUTCOME" != "success" ]]; then
+            status=tests-failed
+          else
+            status=success
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+          report_url=""
+          if [[ "$IS_DEFAULT_BRANCH" == "true" && ( "$status" == "success" || "$status" == "tests-failed" ) && -n "$PAGE_URL" ]]; then
+            report_url="$PAGE_URL"
+          fi
+          echo "report-url=$report_url" >> "$GITHUB_OUTPUT"
+
+      - name: Send Telegram notification
+        id: notify
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ steps.status.outputs.status }}
+          PROJECT: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REPORT_URL: ${{ steps.status.outputs.report-url }}
+          STATS_OK: ${{ needs.ui-tests.outputs.stats-ok }}
+          PASSED: ${{ needs.ui-tests.outputs.stats-passed }}
+          FAILED: ${{ needs.ui-tests.outputs.stats-failed }}
+          SKIPPED: ${{ needs.ui-tests.outputs.stats-skipped }}
+        run: python3 .github/scripts/notify_telegram.py
